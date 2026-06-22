@@ -88,6 +88,14 @@ Edit the manifest directly in your `$EDITOR`:
 perdir edit
 ```
 
+Check the manifest for issues (missing paths, empty fields, invalid values):
+
+```bash
+$ perdir validate
+WARN: ai context path 'README.md' does not exist
+WARN: ai context path 'src/' does not exist
+```
+
 ## MVP
 
 This first version does **not** replace containers, Nix, or the Linux kernel. It creates the manifest and command surface that later versions can back with Nix, Bubblewrap, cgroups, seccomp, and AI-assisted patch generation.

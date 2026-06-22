@@ -43,6 +43,10 @@ enum Commands {
     Log,
     /// Open the environment manifest in $EDITOR.
     Edit,
+    /// Validate the environment manifest for issues.
+    Validate,
+    /// Print shell integration script for auto-activation on cd.
+    ShellInit,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -94,6 +98,8 @@ fn main() -> Result<()> {
         Commands::Explain => explain(),
         Commands::Log => log(),
         Commands::Edit => edit(),
+        Commands::Validate => validate(),
+        Commands::ShellInit => shell_init(),
     }
 }
 
@@ -155,6 +161,10 @@ fn run(command: Vec<String>) -> Result<()> {
     let (root, world) = load_world()?;
     append_log(&root, &format!("run {:?}", command))?;
 
+    check_permissions(&world);
+
+    let venv_bin = ensure_venv(&root, &world)?;
+
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..])
         .current_dir(&root)
@@ -166,10 +176,16 @@ fn run(command: Vec<String>) -> Result<()> {
         cmd.env(key, value);
     }
 
-    // MVP behavior: construct a predictable PERDIR_ROOT and PERDIR_NAME.
-    // Future behavior: use bubblewrap/nix namespaces before exec.
     cmd.env("PERDIR_ROOT", root.to_string_lossy().to_string());
     cmd.env("PERDIR_NAME", world.name);
+
+    if let Some(bin) = &venv_bin {
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{}:{}", bin.display(), current_path));
+        cmd.env("VIRTUAL_ENV", bin.parent().unwrap().display().to_string());
+    }
+
+    apply_permission_env(&world, &mut cmd);
 
     let status = cmd.status().context("failed to spawn command")?;
     std::process::exit(status.code().unwrap_or(1));
@@ -181,6 +197,12 @@ fn enter() -> Result<()> {
     println!("export PERDIR_NAME='{}'", shell_escape(&world.name));
     for (key, value) in world.runtime.env {
         println!("export {}='{}'", key, shell_escape(&value));
+    }
+    let venv_bin = ensure_venv(&root, &world)?;
+    if let Some(bin) = &venv_bin {
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        println!("export PATH='{}:{}'", bin.display(), shell_escape(&current_path));
+        println!("export VIRTUAL_ENV='{}'", bin.parent().unwrap().display());
     }
     println!("# Run this to enter:");
     println!("# eval \"$(perdir enter)\"");
@@ -208,6 +230,69 @@ fn edit() -> Result<()> {
         return Err(anyhow!("editor exited with non-zero status"));
     }
     Ok(())
+}
+
+fn validate() -> Result<()> {
+    let (root, world) = load_world()?;
+    let issues = validate_world(&root, &world);
+    if issues.is_empty() {
+        println!("Manifest is valid. No issues found.");
+    } else {
+        for issue in &issues {
+            println!("{}", issue);
+        }
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn validate_world(root: &Path, world: &World) -> Vec<String> {
+    let mut issues = Vec::new();
+
+    if world.name.trim().is_empty() {
+        issues.push("ERROR: name is empty".to_string());
+    }
+
+    if world.runtime.packages.is_empty() {
+        issues.push("WARN: no runtime packages declared".to_string());
+    }
+
+    if let Some(ref py) = world.runtime.python {
+        if !py.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            issues.push(format!(
+                "WARN: python version '{}' contains unexpected characters",
+                py
+            ));
+        }
+    }
+
+    for ctx_path in &world.ai.context {
+        let full = root.join(ctx_path);
+        if !full.exists() {
+            issues.push(format!(
+                "WARN: ai context path '{}' does not exist",
+                ctx_path
+            ));
+        }
+    }
+
+    if world.ai.memory_file.trim().is_empty() {
+        issues.push("ERROR: ai.memory_file is empty".to_string());
+    } else {
+        let mem_full = root.join(&world.ai.memory_file);
+        if !mem_full.exists() {
+            issues.push(format!(
+                "WARN: ai memory file '{}' does not exist",
+                world.ai.memory_file
+            ));
+        }
+    }
+
+    if world.ai.model.trim().is_empty() {
+        issues.push("WARN: ai.model is empty".to_string());
+    }
+
+    issues
 }
 
 fn explain() -> Result<()> {
@@ -259,4 +344,237 @@ fn append_log(root: &Path, action: &str) -> Result<()> {
 
 fn shell_escape(input: &str) -> String {
     input.replace('\\', "\\\\").replace('\'', "'\\''")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shell_escape_plain() {
+        assert_eq!(shell_escape("hello"), "hello");
+    }
+
+    #[test]
+    fn test_shell_escape_single_quote() {
+        assert_eq!(shell_escape("it's"), "it'\\''s");
+    }
+
+    #[test]
+    fn test_shell_escape_backslash() {
+        assert_eq!(shell_escape("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn test_shell_escape_combined() {
+        assert_eq!(shell_escape("it's a\\test"), "it'\\''s a\\\\test");
+    }
+
+    #[test]
+    fn test_find_world_root_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let perdir = dir.path().join(PERDIR_DIR);
+        fs::create_dir_all(&perdir).unwrap();
+        fs::write(perdir.join(WORLD_FILE), "").unwrap();
+
+        let sub = dir.path().join("nested").join("deep");
+        fs::create_dir_all(&sub).unwrap();
+
+        let root = find_world_root(sub).unwrap();
+        assert_eq!(root, dir.path());
+    }
+
+    #[test]
+    fn test_find_world_root_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = find_world_root(dir.path().to_path_buf());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_append_log_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let perdir = dir.path().join(PERDIR_DIR);
+        fs::create_dir_all(&perdir).unwrap();
+
+        append_log(dir.path(), "test-action").unwrap();
+        append_log(dir.path(), "second-action").unwrap();
+
+        let contents = fs::read_to_string(perdir.join(LOG_FILE)).unwrap();
+        assert!(contents.contains("test-action"));
+        assert!(contents.contains("second-action"));
+    }
+
+    #[test]
+    fn test_world_serde_roundtrip() {
+        let world = World {
+            name: "test-project".to_string(),
+            runtime: Runtime {
+                python: Some("3.12".to_string()),
+                packages: vec!["python".to_string(), "nodejs".to_string()],
+                env: [("RUST_LOG".to_string(), "debug".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+            permissions: Permissions {
+                network: PermissionMode::Deny,
+                home: PermissionMode::Allow,
+                gpu: true,
+            },
+            ai: Ai {
+                context: vec!["README.md".to_string()],
+                memory_file: ".perdir/memory.md".to_string(),
+                model: "gpt-4".to_string(),
+            },
+        };
+
+        let toml_str = toml::to_string_pretty(&world).unwrap();
+        let parsed: World = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.name, world.name);
+        assert_eq!(parsed.runtime.python, world.runtime.python);
+        assert_eq!(parsed.runtime.packages, world.runtime.packages);
+        assert_eq!(parsed.permissions.gpu, world.permissions.gpu);
+        assert_eq!(parsed.ai.model, world.ai.model);
+    }
+
+    #[test]
+    fn test_world_serde_permission_kebab_case() {
+        let toml_str = r#"
+name = "test"
+runtime = { python = "3.12", packages = [], env = {} }
+permissions = { network = "read-only", home = "allow", gpu = false }
+ai = { context = [], memory_file = "mem.md", model = "test" }
+"#;
+        let world: World = toml::from_str(toml_str).unwrap();
+        assert!(matches!(
+            world.permissions.network,
+            PermissionMode::ReadOnly
+        ));
+        assert!(matches!(world.permissions.home, PermissionMode::Allow));
+    }
+
+    #[test]
+    fn test_validate_world_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let perdir = dir.path().join(PERDIR_DIR);
+        fs::create_dir_all(&perdir).unwrap();
+        fs::write(perdir.join("memory.md"), "# Memory\n").unwrap();
+        fs::write(dir.path().join("README.md"), "# Test\n").unwrap();
+
+        let world = World {
+            name: "test".to_string(),
+            runtime: Runtime {
+                python: Some("3.12".to_string()),
+                packages: vec!["python".to_string()],
+                env: Default::default(),
+            },
+            permissions: Permissions {
+                network: PermissionMode::Ask,
+                home: PermissionMode::ReadOnly,
+                gpu: false,
+            },
+            ai: Ai {
+                context: vec!["README.md".to_string()],
+                memory_file: ".perdir/memory.md".to_string(),
+                model: "local".to_string(),
+            },
+        };
+
+        let issues = validate_world(dir.path(), &world);
+        assert!(issues.is_empty(), "expected no issues, got: {:?}", issues);
+    }
+
+    #[test]
+    fn test_validate_world_missing_context_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let perdir = dir.path().join(PERDIR_DIR);
+        fs::create_dir_all(&perdir).unwrap();
+        fs::write(perdir.join("memory.md"), "# Memory\n").unwrap();
+
+        let world = World {
+            name: "test".to_string(),
+            runtime: Runtime {
+                python: Some("3.12".to_string()),
+                packages: vec!["python".to_string()],
+                env: Default::default(),
+            },
+            permissions: Permissions {
+                network: PermissionMode::Ask,
+                home: PermissionMode::ReadOnly,
+                gpu: false,
+            },
+            ai: Ai {
+                context: vec!["README.md".to_string()],
+                memory_file: ".perdir/memory.md".to_string(),
+                model: "local".to_string(),
+            },
+        };
+
+        let issues = validate_world(dir.path(), &world);
+        assert!(issues
+            .iter()
+            .any(|i| i.contains("README.md") && i.contains("does not exist")));
+    }
+
+    #[test]
+    fn test_validate_world_empty_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let perdir = dir.path().join(PERDIR_DIR);
+        fs::create_dir_all(&perdir).unwrap();
+        fs::write(perdir.join("memory.md"), "# Memory\n").unwrap();
+
+        let world = World {
+            name: "".to_string(),
+            runtime: Runtime {
+                python: Some("3.12".to_string()),
+                packages: vec!["python".to_string()],
+                env: Default::default(),
+            },
+            permissions: Permissions {
+                network: PermissionMode::Ask,
+                home: PermissionMode::ReadOnly,
+                gpu: false,
+            },
+            ai: Ai {
+                context: vec![],
+                memory_file: ".perdir/memory.md".to_string(),
+                model: "local".to_string(),
+            },
+        };
+
+        let issues = validate_world(dir.path(), &world);
+        assert!(issues.iter().any(|i| i.contains("name is empty")));
+    }
+
+    #[test]
+    fn test_validate_world_bad_python_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let perdir = dir.path().join(PERDIR_DIR);
+        fs::create_dir_all(&perdir).unwrap();
+        fs::write(perdir.join("memory.md"), "# Memory\n").unwrap();
+
+        let world = World {
+            name: "test".to_string(),
+            runtime: Runtime {
+                python: Some("latest".to_string()),
+                packages: vec!["python".to_string()],
+                env: Default::default(),
+            },
+            permissions: Permissions {
+                network: PermissionMode::Ask,
+                home: PermissionMode::ReadOnly,
+                gpu: false,
+            },
+            ai: Ai {
+                context: vec![],
+                memory_file: ".perdir/memory.md".to_string(),
+                model: "local".to_string(),
+            },
+        };
+
+        let issues = validate_world(dir.path(), &world);
+        assert!(issues
+            .iter()
+            .any(|i| i.contains("python version") && i.contains("unexpected")));
+    }
 }
