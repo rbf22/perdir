@@ -47,6 +47,8 @@ enum Commands {
     Validate,
     /// Print shell integration script for auto-activation on cd.
     ShellInit,
+    /// Clean the venv and package marker, forcing a fresh rebuild on next run.
+    Clean,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -60,7 +62,10 @@ struct World {
 #[derive(Debug, Serialize, Deserialize)]
 struct Runtime {
     python: Option<String>,
+    #[serde(default)]
     packages: Vec<String>,
+    #[serde(default)]
+    pip_packages: Vec<String>,
     env: std::collections::BTreeMap<String, String>,
 }
 
@@ -100,6 +105,7 @@ fn main() -> Result<()> {
         Commands::Edit => edit(),
         Commands::Validate => validate(),
         Commands::ShellInit => shell_init(),
+        Commands::Clean => clean(),
     }
 }
 
@@ -124,6 +130,7 @@ fn init(name: Option<String>) -> Result<()> {
         runtime: Runtime {
             python: Some("3.12".to_string()),
             packages: vec!["python".to_string()],
+            pip_packages: vec![],
             env: Default::default(),
         },
         permissions: Permissions {
@@ -161,7 +168,9 @@ fn run(command: Vec<String>) -> Result<()> {
     let (root, world) = load_world()?;
     append_log(&root, &format!("run {:?}", command))?;
 
-    check_permissions(&world);
+    if !check_permissions(&world) {
+        return Ok(());
+    }
 
     let venv_bin = ensure_venv(&root, &world)?;
 
@@ -177,7 +186,7 @@ fn run(command: Vec<String>) -> Result<()> {
     }
 
     cmd.env("PERDIR_ROOT", root.to_string_lossy().to_string());
-    cmd.env("PERDIR_NAME", world.name);
+    cmd.env("PERDIR_NAME", world.name.clone());
 
     if let Some(bin) = &venv_bin {
         let current_path = std::env::var("PATH").unwrap_or_default();
@@ -185,7 +194,7 @@ fn run(command: Vec<String>) -> Result<()> {
         cmd.env("VIRTUAL_ENV", bin.parent().unwrap().display().to_string());
     }
 
-    apply_permission_env(&world, &mut cmd);
+    apply_permission_env(&root, &world, &mut cmd);
 
     let status = cmd.status().context("failed to spawn command")?;
     std::process::exit(status.code().unwrap_or(1));
@@ -195,13 +204,17 @@ fn enter() -> Result<()> {
     let (root, world) = load_world()?;
     println!("export PERDIR_ROOT='{}'", root.display());
     println!("export PERDIR_NAME='{}'", shell_escape(&world.name));
-    for (key, value) in world.runtime.env {
-        println!("export {}='{}'", key, shell_escape(&value));
+    for (key, value) in &world.runtime.env {
+        println!("export {}='{}'", key, shell_escape(value));
     }
     let venv_bin = ensure_venv(&root, &world)?;
     if let Some(bin) = &venv_bin {
         let current_path = std::env::var("PATH").unwrap_or_default();
-        println!("export PATH='{}:{}'", bin.display(), shell_escape(&current_path));
+        println!(
+            "export PATH='{}:{}'",
+            bin.display(),
+            shell_escape(&current_path)
+        );
         println!("export VIRTUAL_ENV='{}'", bin.parent().unwrap().display());
     }
     println!("# Run this to enter:");
@@ -253,7 +266,7 @@ fn validate_world(root: &Path, world: &World) -> Vec<String> {
         issues.push("ERROR: name is empty".to_string());
     }
 
-    if world.runtime.packages.is_empty() {
+    if world.runtime.packages.is_empty() && world.runtime.pip_packages.is_empty() {
         issues.push("WARN: no runtime packages declared".to_string());
     }
 
@@ -302,12 +315,169 @@ fn explain() -> Result<()> {
         world.name
     );
     println!("Runtime packages: {}", world.runtime.packages.join(", "));
+    println!("Pip packages: {}", world.runtime.pip_packages.join(", "));
     println!("Network permission: {:?}", world.permissions.network);
     println!("Home permission: {:?}", world.permissions.home);
     println!("GPU access: {}", world.permissions.gpu);
     println!("AI context paths: {}", world.ai.context.join(", "));
     println!("AI memory file: {}", world.ai.memory_file);
     Ok(())
+}
+
+fn shell_init() -> Result<()> {
+    let script = r#"# perdir shell integration — add to ~/.zshrc or ~/.bashrc:
+#   eval "$(perdir shell-init)"
+
+__perdir_hook() {
+    if [ -f ".perdir/world.toml" ]; then
+        if [ -z "$PERDIR_ROOT" ] || [ "$PERDIR_ROOT" != "$(pwd)" ]; then
+            eval "$(perdir enter 2>/dev/null)"
+        fi
+    elif [ -n "$PERDIR_ROOT" ]; then
+        unset PERDIR_ROOT PERDIR_NAME VIRTUAL_ENV
+    fi
+}
+
+# zsh uses chpwd_functions, bash overrides PROMPT_COMMAND
+if [ -n "$ZSH_VERSION" ]; then
+    chpwd_functions=(__perdir_hook $chpwd_functions)
+    __perdir_hook
+elif [ -n "$BASH_VERSION" ]; then
+    __perdir_prompt_cmd() { __perdir_hook; }
+    PROMPT_COMMAND="__perdir_prompt_cmd;$PROMPT_COMMAND"
+    __perdir_hook
+fi
+"#;
+    print!("{}", script);
+    Ok(())
+}
+
+fn clean() -> Result<()> {
+    let (root, _world) = load_world()?;
+    clean_venv(&root)
+}
+
+fn clean_venv(root: &Path) -> Result<()> {
+    let venv_dir = root.join(PERDIR_DIR).join("venv");
+
+    if !venv_dir.exists() {
+        println!("No venv found at {}. Nothing to clean.", venv_dir.display());
+        return Ok(());
+    }
+
+    fs::remove_dir_all(&venv_dir)
+        .with_context(|| format!("failed to remove {}", venv_dir.display()))?;
+    append_log(root, "clean")?;
+    println!(
+        "Removed venv at {}. Next `perdir run` will recreate it.",
+        venv_dir.display()
+    );
+    Ok(())
+}
+
+fn ensure_venv(root: &Path, world: &World) -> Result<Option<PathBuf>> {
+    let python = match &world.runtime.python {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+
+    let venv_dir = root.join(PERDIR_DIR).join("venv");
+    let venv_bin = venv_dir.join("bin");
+
+    if !venv_bin.exists() {
+        let py_bin = format!("python{}", python);
+        let python_cmd = which::which(&py_bin)
+            .or_else(|_| which::which("python3"))
+            .map_err(|_| anyhow!("no python interpreter found for venv creation"))?;
+
+        println!("Creating venv at {} ...", venv_dir.display());
+        let status = Command::new(&python_cmd)
+            .arg("-m")
+            .arg("venv")
+            .arg(&venv_dir)
+            .status()
+            .context("failed to spawn python venv creation")?;
+        if !status.success() {
+            return Err(anyhow!("venv creation failed"));
+        }
+    }
+
+    let marker = venv_dir.join(".perdir_packages");
+    let packages_json = serde_json::to_string(&world.runtime.pip_packages)?;
+
+    let needs_install = match fs::read_to_string(&marker) {
+        Ok(prev) => prev != packages_json,
+        Err(_) => true,
+    };
+
+    if needs_install && !world.runtime.pip_packages.is_empty() {
+        let pip = venv_bin.join("pip");
+        println!(
+            "Installing packages: {} ...",
+            world.runtime.pip_packages.join(", ")
+        );
+        let status = Command::new(&pip)
+            .arg("install")
+            .args(&world.runtime.pip_packages)
+            .status()
+            .context("failed to spawn pip install")?;
+        if !status.success() {
+            return Err(anyhow!("pip install failed"));
+        }
+        fs::write(&marker, &packages_json)?;
+    }
+
+    Ok(Some(venv_bin))
+}
+
+fn check_permissions(world: &World) -> bool {
+    if matches!(world.permissions.network, PermissionMode::Ask) {
+        eprint!("[perdir] Network access is set to 'ask'. Allow network for this command? [y/N] ");
+        std::io::stderr().flush().ok();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).ok();
+        if !input.trim().eq_ignore_ascii_case("y") {
+            eprintln!("[perdir] Aborted by user.");
+            return false;
+        }
+    }
+
+    if let PermissionMode::Deny = world.permissions.network {
+        eprintln!("[perdir] WARNING: network access is denied by manifest policy (not enforced — requires OS-level sandboxing)");
+    }
+
+    match world.permissions.home {
+        PermissionMode::Deny => {
+            eprintln!("[perdir] WARNING: home directory access is denied by manifest policy (not enforced — requires OS-level sandboxing)");
+        }
+        PermissionMode::ReadOnly => {
+            eprintln!("[perdir] NOTICE: home directory is read-only by manifest policy (not enforced — requires OS-level sandboxing)");
+        }
+        _ => {}
+    }
+
+    if !world.permissions.gpu {
+        eprintln!("[perdir] NOTICE: GPU access is disabled by manifest policy (not enforced)");
+    }
+
+    true
+}
+
+fn apply_permission_env(root: &Path, world: &World, cmd: &mut Command) {
+    if matches!(world.permissions.network, PermissionMode::Deny) {
+        cmd.env("no_proxy", "*");
+        cmd.env("NO_PROXY", "*");
+        cmd.env_remove("http_proxy");
+        cmd.env_remove("https_proxy");
+        cmd.env_remove("HTTP_PROXY");
+        cmd.env_remove("HTTPS_PROXY");
+    }
+
+    if matches!(world.permissions.home, PermissionMode::Deny) {
+        let sandbox_home = root.join(PERDIR_DIR).join("home");
+        let _ = fs::create_dir_all(&sandbox_home);
+        cmd.env("HOME", sandbox_home.to_string_lossy().to_string());
+    }
 }
 
 fn load_world() -> Result<(PathBuf, World)> {
@@ -412,6 +582,7 @@ mod tests {
             runtime: Runtime {
                 python: Some("3.12".to_string()),
                 packages: vec!["python".to_string(), "nodejs".to_string()],
+                pip_packages: vec![],
                 env: [("RUST_LOG".to_string(), "debug".to_string())]
                     .into_iter()
                     .collect(),
@@ -441,7 +612,7 @@ mod tests {
     fn test_world_serde_permission_kebab_case() {
         let toml_str = r#"
 name = "test"
-runtime = { python = "3.12", packages = [], env = {} }
+runtime = { python = "3.12", packages = [], pip_packages = [], env = {} }
 permissions = { network = "read-only", home = "allow", gpu = false }
 ai = { context = [], memory_file = "mem.md", model = "test" }
 "#;
@@ -466,6 +637,7 @@ ai = { context = [], memory_file = "mem.md", model = "test" }
             runtime: Runtime {
                 python: Some("3.12".to_string()),
                 packages: vec!["python".to_string()],
+                pip_packages: vec![],
                 env: Default::default(),
             },
             permissions: Permissions {
@@ -496,6 +668,7 @@ ai = { context = [], memory_file = "mem.md", model = "test" }
             runtime: Runtime {
                 python: Some("3.12".to_string()),
                 packages: vec!["python".to_string()],
+                pip_packages: vec![],
                 env: Default::default(),
             },
             permissions: Permissions {
@@ -528,6 +701,7 @@ ai = { context = [], memory_file = "mem.md", model = "test" }
             runtime: Runtime {
                 python: Some("3.12".to_string()),
                 packages: vec!["python".to_string()],
+                pip_packages: vec![],
                 env: Default::default(),
             },
             permissions: Permissions {
@@ -558,6 +732,7 @@ ai = { context = [], memory_file = "mem.md", model = "test" }
             runtime: Runtime {
                 python: Some("latest".to_string()),
                 packages: vec!["python".to_string()],
+                pip_packages: vec![],
                 env: Default::default(),
             },
             permissions: Permissions {
@@ -576,5 +751,141 @@ ai = { context = [], memory_file = "mem.md", model = "test" }
         assert!(issues
             .iter()
             .any(|i| i.contains("python version") && i.contains("unexpected")));
+    }
+
+    #[test]
+    fn test_shell_init_output() {
+        shell_init().unwrap();
+    }
+
+    #[test]
+    fn test_ensure_venv_no_python() {
+        let dir = tempfile::tempdir().unwrap();
+        let perdir = dir.path().join(PERDIR_DIR);
+        fs::create_dir_all(&perdir).unwrap();
+
+        let world = World {
+            name: "test".to_string(),
+            runtime: Runtime {
+                python: None,
+                packages: vec![],
+                pip_packages: vec![],
+                env: Default::default(),
+            },
+            permissions: Permissions {
+                network: PermissionMode::Ask,
+                home: PermissionMode::ReadOnly,
+                gpu: false,
+            },
+            ai: Ai {
+                context: vec![],
+                memory_file: ".perdir/memory.md".to_string(),
+                model: "local".to_string(),
+            },
+        };
+
+        let result = ensure_venv(dir.path(), &world).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_check_permissions_deny_network() {
+        let world = World {
+            name: "test".to_string(),
+            runtime: Runtime {
+                python: None,
+                packages: vec![],
+                pip_packages: vec![],
+                env: Default::default(),
+            },
+            permissions: Permissions {
+                network: PermissionMode::Deny,
+                home: PermissionMode::Allow,
+                gpu: true,
+            },
+            ai: Ai {
+                context: vec![],
+                memory_file: "mem.md".to_string(),
+                model: "test".to_string(),
+            },
+        };
+        assert!(check_permissions(&world));
+    }
+
+    #[test]
+    fn test_check_permissions_all_allow() {
+        let world = World {
+            name: "test".to_string(),
+            runtime: Runtime {
+                python: None,
+                packages: vec![],
+                pip_packages: vec![],
+                env: Default::default(),
+            },
+            permissions: Permissions {
+                network: PermissionMode::Allow,
+                home: PermissionMode::Allow,
+                gpu: true,
+            },
+            ai: Ai {
+                context: vec![],
+                memory_file: "mem.md".to_string(),
+                model: "test".to_string(),
+            },
+        };
+        assert!(check_permissions(&world));
+    }
+
+    #[test]
+    fn test_apply_permission_env_deny_network() {
+        let world = World {
+            name: "test".to_string(),
+            runtime: Runtime {
+                python: None,
+                packages: vec![],
+                pip_packages: vec![],
+                env: Default::default(),
+            },
+            permissions: Permissions {
+                network: PermissionMode::Deny,
+                home: PermissionMode::Allow,
+                gpu: true,
+            },
+            ai: Ai {
+                context: vec![],
+                memory_file: "mem.md".to_string(),
+                model: "test".to_string(),
+            },
+        };
+
+        let mut cmd = Command::new("echo");
+        apply_permission_env(Path::new("/tmp"), &world, &mut cmd);
+    }
+
+    #[test]
+    fn test_clean_removes_venv() {
+        let dir = tempfile::tempdir().unwrap();
+        let perdir = dir.path().join(PERDIR_DIR);
+        fs::create_dir_all(&perdir).unwrap();
+        fs::write(perdir.join(WORLD_FILE), "name = \"test\"\n").unwrap();
+
+        let venv_dir = perdir.join("venv");
+        fs::create_dir_all(venv_dir.join("bin")).unwrap();
+        fs::write(venv_dir.join(".perdir_packages"), "[]").unwrap();
+
+        assert!(venv_dir.exists());
+        assert!(clean_venv(dir.path()).is_ok());
+        assert!(!venv_dir.exists());
+    }
+
+    #[test]
+    fn test_clean_no_venv() {
+        let dir = tempfile::tempdir().unwrap();
+        let perdir = dir.path().join(PERDIR_DIR);
+        fs::create_dir_all(&perdir).unwrap();
+        fs::write(perdir.join(WORLD_FILE), "name = \"test\"\n").unwrap();
+
+        assert!(!perdir.join("venv").exists());
+        assert!(clean_venv(dir.path()).is_ok());
     }
 }

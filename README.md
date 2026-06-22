@@ -47,11 +47,18 @@ Get a human-readable summary of the manifest:
 perdir explain
 ```
 
-Run a command inside the declared environment (env vars from `world.toml` are applied):
+Run a command inside the declared environment. Env vars from `world.toml` are applied, and if a Python version is declared, a venv is automatically created and activated:
 
 ```bash
-perdir run env
+perdir run python --version
 ```
+
+The venv is stored at `.perdir/venv/` and packages from the manifest are installed automatically (only when the package list changes). Permission policies are checked before running:
+
+- **`network = "ask"`** — prompts with `[y/N]` before running the command. Answering `n` aborts.
+- **`network = "deny"`** — prints a warning but is **not enforced**. True network isolation requires OS-level sandboxing (`sandbox-exec` on macOS, `bubblewrap` on Linux), which is on the roadmap.
+- **`home = "deny"` / `home = "read-only"`** — prints a warning but is **not enforced**. Same sandboxing limitation applies.
+- **`gpu = false`** — prints a notice but is **not enforced**.
 
 Print shell exports for the environment. Running `perdir enter` alone shows what would be set:
 
@@ -88,6 +95,12 @@ Edit the manifest directly in your `$EDITOR`:
 perdir edit
 ```
 
+Remove the venv to force a fresh rebuild on next `perdir run`:
+
+```bash
+perdir clean
+```
+
 Check the manifest for issues (missing paths, empty fields, invalid values):
 
 ```bash
@@ -95,6 +108,16 @@ $ perdir validate
 WARN: ai context path 'README.md' does not exist
 WARN: ai context path 'src/' does not exist
 ```
+
+## Shell Integration
+
+Auto-activate the environment when you `cd` into a perdir directory. Add this to your `~/.zshrc` or `~/.bashrc`:
+
+```bash
+eval "$(perdir shell-init)"
+```
+
+Now whenever you enter a directory with a `.perdir/world.toml`, the environment variables and venv path are automatically applied. When you leave, they're unset.
 
 ## MVP
 
@@ -109,6 +132,13 @@ Each project gets:
   world.toml
   memory.md
   audit.log
+  venv/          # auto-created, gitignore this
+```
+
+Add `.perdir/venv/` to your project's `.gitignore`:
+
+```gitignore
+.perdir/venv/
 ```
 
 Example:
@@ -119,6 +149,7 @@ name = "example"
 [runtime]
 python = "3.12"
 packages = ["python"]
+pip_packages = ["requests", "rich"]
 
 [runtime.env]
 RUST_LOG = "info"
@@ -138,7 +169,7 @@ model = "local-or-cloud"
 
 - [ ] Nix-backed dependency resolution
 - [ ] Bubblewrap-backed filesystem isolation
-- [ ] Permission prompts and policy enforcement
+- [x] Permission prompts and policy enforcement
 - [ ] AI command: propose manifest changes as reviewable diffs
 - [ ] Rollbackable environment transactions
-- [ ] Shell integration for automatic directory activation
+- [x] Shell integration for automatic directory activation
