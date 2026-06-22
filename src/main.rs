@@ -182,7 +182,10 @@ fn enter() -> Result<()> {
 
 fn explain() -> Result<()> {
     let (_root, world) = load_world()?;
-    println!("This directory declares an environment named '{}'.", world.name);
+    println!(
+        "This directory declares an environment named '{}'.",
+        world.name
+    );
     println!("Runtime packages: {}", world.runtime.packages.join(", "));
     println!("Network permission: {:?}", world.permissions.network);
     println!("Home permission: {:?}", world.permissions.home);
@@ -208,7 +211,9 @@ fn find_world_root(start: PathBuf) -> Result<PathBuf> {
             return Ok(candidate.to_path_buf());
         }
     }
-    Err(anyhow!("not inside a perdir environment; run `perdir init` first"))
+    Err(anyhow!(
+        "not inside a perdir environment; run `perdir init` first"
+    ))
 }
 
 fn append_log(root: &Path, action: &str) -> Result<()> {
