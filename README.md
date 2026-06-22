@@ -56,8 +56,8 @@ perdir run python --version
 The venv is stored at `.perdir/venv/` and packages from the manifest are installed automatically (only when the package list changes). Permission policies are checked before running:
 
 - **`network = "ask"`** — prompts with `[y/N]` before running the command. Answering `n` aborts.
-- **`network = "deny"`** — prints a warning but is **not enforced**. True network isolation requires OS-level sandboxing (`sandbox-exec` on macOS, `bubblewrap` on Linux), which is on the roadmap.
-- **`home = "deny"` / `home = "read-only"`** — prints a warning but is **not enforced**. Same sandboxing limitation applies.
+- **`network = "deny"`** — **enforced**. Uses OS-level sandboxing to block all network sockets in the child process: macOS Seatbelt (`kSBXProfileNoNetwork`) via `sandbox_init`, Linux network namespaces (`CLONE_NEWNET`) via `unshare`. The sandbox is applied in `pre_exec` after fork but before exec, so only the child process is restricted.
+- **`home = "deny"` / `home = "read-only"`** — prints a warning but is **not enforced**. Filesystem sandboxing is on the roadmap.
 - **`gpu = false`** — prints a notice but is **not enforced**.
 
 Print shell exports for the environment. Running `perdir enter` alone shows what would be set:
@@ -101,6 +101,22 @@ Remove the venv to force a fresh rebuild on next `perdir run`:
 perdir clean
 ```
 
+Create the venv and install packages from the manifest:
+
+```bash
+perdir install
+```
+
+This creates `.perdir/venv/`, installs `pip_packages`, and writes `.perdir/perdir.lock` with exact installed versions. `perdir run` will use the existing venv without reinstalling.
+
+Ask AI to propose manifest changes based on your context files and a prompt:
+
+```bash
+perdir ai "add numpy and pandas to pip_packages"
+```
+
+This reads your `ai.context` files and `memory.md`, sends them with the current manifest to an OpenAI-compatible API, and prints a proposed manifest. Answer `y` to apply it. Requires `OPENAI_API_KEY` (or set `OPENAI_BASE_URL` for a local model via Ollama/LM Studio). The model is determined by `ai.model` in the manifest (defaults to `gpt-4o`).
+
 Check the manifest for issues (missing paths, empty fields, invalid values):
 
 ```bash
@@ -132,10 +148,11 @@ Each project gets:
   world.toml
   memory.md
   audit.log
-  venv/          # auto-created, gitignore this
+  venv/          # auto-created by perdir install, gitignore this
+  perdir.lock    # pinned package versions, commit this
 ```
 
-Add `.perdir/venv/` to your project's `.gitignore`:
+Add `.perdir/venv/` to your project's `.gitignore` (but commit `.perdir/perdir.lock` for reproducibility):
 
 ```gitignore
 .perdir/venv/
@@ -168,8 +185,11 @@ model = "local-or-cloud"
 ## Roadmap
 
 - [ ] Nix-backed dependency resolution
-- [ ] Bubblewrap-backed filesystem isolation
+- [ ] Filesystem isolation (home deny/read-only enforcement)
+- [x] Network isolation (deny enforced via macOS Seatbelt / Linux namespaces)
 - [x] Permission prompts and policy enforcement
 - [ ] AI command: propose manifest changes as reviewable diffs
+- [x] AI command: propose manifest changes via OpenAI-compatible API
 - [ ] Rollbackable environment transactions
 - [x] Shell integration for automatic directory activation
+- [x] Venv management with lock file (perdir install / perdir clean)

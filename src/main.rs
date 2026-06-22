@@ -49,6 +49,14 @@ enum Commands {
     ShellInit,
     /// Clean the venv and package marker, forcing a fresh rebuild on next run.
     Clean,
+    /// Create the venv and install packages from the manifest.
+    Install,
+    /// Ask AI to propose manifest changes based on context files and a prompt.
+    Ai {
+        /// The request or question for the AI.
+        #[arg(required = true, trailing_var_arg = true)]
+        prompt: Vec<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -106,6 +114,8 @@ fn main() -> Result<()> {
         Commands::Validate => validate(),
         Commands::ShellInit => shell_init(),
         Commands::Clean => clean(),
+        Commands::Install => install(),
+        Commands::Ai { prompt } => ai(prompt),
     }
 }
 
@@ -172,7 +182,7 @@ fn run(command: Vec<String>) -> Result<()> {
         return Ok(());
     }
 
-    let venv_bin = ensure_venv(&root, &world)?;
+    let venv_bin = activate_venv(&root, &world);
 
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..])
@@ -207,7 +217,7 @@ fn enter() -> Result<()> {
     for (key, value) in &world.runtime.env {
         println!("export {}='{}'", key, shell_escape(value));
     }
-    let venv_bin = ensure_venv(&root, &world)?;
+    let venv_bin = activate_venv(&root, &world);
     if let Some(bin) = &venv_bin {
         let current_path = std::env::var("PATH").unwrap_or_default();
         println!(
@@ -369,13 +379,36 @@ fn clean_venv(root: &Path) -> Result<()> {
         .with_context(|| format!("failed to remove {}", venv_dir.display()))?;
     append_log(root, "clean")?;
     println!(
-        "Removed venv at {}. Next `perdir run` will recreate it.",
+        "Removed venv at {}. Run `perdir install` to recreate it.",
         venv_dir.display()
     );
     Ok(())
 }
 
-fn ensure_venv(root: &Path, world: &World) -> Result<Option<PathBuf>> {
+fn activate_venv(root: &Path, world: &World) -> Option<PathBuf> {
+    world.runtime.python.as_ref()?;
+
+    let venv_bin = root.join(PERDIR_DIR).join("venv").join("bin");
+    if venv_bin.exists() {
+        Some(venv_bin)
+    } else {
+        eprintln!("[perdir] No venv found. Run `perdir install` to create one.");
+        None
+    }
+}
+
+fn install() -> Result<()> {
+    let (root, world) = load_world()?;
+    let venv_bin = create_venv(&root, &world)?;
+    if let Some(bin) = &venv_bin {
+        install_packages(&root, &world, bin)?;
+    }
+    append_log(&root, "install")?;
+    println!("Environment ready. Use `perdir run <command>` to execute commands.");
+    Ok(())
+}
+
+fn create_venv(root: &Path, world: &World) -> Result<Option<PathBuf>> {
     let python = match &world.runtime.python {
         Some(p) => p,
         None => return Ok(None),
@@ -402,7 +435,11 @@ fn ensure_venv(root: &Path, world: &World) -> Result<Option<PathBuf>> {
         }
     }
 
-    let marker = venv_dir.join(".perdir_packages");
+    Ok(Some(venv_bin))
+}
+
+fn install_packages(root: &Path, world: &World, venv_bin: &Path) -> Result<()> {
+    let marker = venv_bin.parent().unwrap().join(".perdir_packages");
     let packages_json = serde_json::to_string(&world.runtime.pip_packages)?;
 
     let needs_install = match fs::read_to_string(&marker) {
@@ -427,7 +464,134 @@ fn ensure_venv(root: &Path, world: &World) -> Result<Option<PathBuf>> {
         fs::write(&marker, &packages_json)?;
     }
 
-    Ok(Some(venv_bin))
+    write_lock_file(root, venv_bin)?;
+    Ok(())
+}
+
+fn write_lock_file(root: &Path, venv_bin: &Path) -> Result<()> {
+    let pip = venv_bin.join("pip");
+    let output = Command::new(&pip)
+        .arg("list")
+        .arg("--format=freeze")
+        .output()
+        .context("failed to run pip list")?;
+    let lock_path = root.join(PERDIR_DIR).join("perdir.lock");
+    fs::write(&lock_path, &output.stdout)?;
+    Ok(())
+}
+
+fn ai(prompt: Vec<String>) -> Result<()> {
+    let (root, world) = load_world()?;
+    let user_prompt = prompt.join(" ");
+    append_log(&root, &format!("ai {:?}", user_prompt))?;
+
+    let manifest = toml::to_string_pretty(&world)?;
+
+    let mut context = String::new();
+    for ctx_path in &world.ai.context {
+        let full = root.join(ctx_path);
+        if full.is_dir() {
+            for entry in fs::read_dir(&full)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_file() {
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        context.push_str(&format!("--- {} ---\n{}\n\n", ctx_path, content));
+                    }
+                }
+            }
+        } else if let Ok(content) = fs::read_to_string(&full) {
+            context.push_str(&format!("--- {} ---\n{}\n\n", ctx_path, content));
+        }
+    }
+
+    let memory = fs::read_to_string(root.join(&world.ai.memory_file))
+        .unwrap_or_else(|_| "# No memory file\n".to_string());
+
+    let system = format!(
+        "You are perdir's AI assistant. You help users manage their per-directory environment manifest.\n\
+         The manifest is a TOML file called world.toml with this structure:\n\
+         - name: string\n\
+         - [runtime]: python (optional version string), packages (system-level), pip_packages (PyPI packages), env (key-value map)\n\
+         - [permissions]: network (allow/ask/deny), home (allow/ask/deny/read-only), gpu (bool)\n\
+         - [ai]: context (file paths), memory_file, model\n\n\
+         When the user asks you to modify the manifest, output the COMPLETE updated manifest in a ```toml code block.\n\
+         Do not include any explanation outside the code block if you are proposing changes.\n\
+         If you are only answering a question, respond normally.\n\n\
+         Current manifest:\n```toml\n{}\n```\n\n\
+         Memory:\n{}\n\n\
+         Context files:\n{}",
+        manifest, memory, context
+    );
+
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .map_err(|_| anyhow!("OPENAI_API_KEY not set. Set it to use perdir ai."))?;
+    let base_url = std::env::var("OPENAI_BASE_URL")
+        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+    let model = if world.ai.model.trim().is_empty() || world.ai.model == "local-or-cloud" {
+        "gpt-4o".to_string()
+    } else {
+        world.ai.model.clone()
+    };
+
+    println!("[perdir] Asking {} ...", model);
+
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .post(format!("{}/chat/completions", base_url))
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.3,
+        }))
+        .send()
+        .context("failed to send request to AI API")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        return Err(anyhow!("AI API error ({}): {}", status, body));
+    }
+
+    let body: serde_json::Value = resp.json().context("failed to parse AI API response")?;
+    let content = body["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or_else(|| anyhow!("unexpected AI API response format"))?;
+
+    if let Some(toml_block) = extract_toml_block(content) {
+        println!("Proposed manifest:\n");
+        println!("```toml");
+        println!("{}", toml_block);
+        println!("```");
+
+        eprint!("\nApply this manifest? [y/N] ");
+        std::io::stderr().flush().ok();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).ok();
+        if input.trim().eq_ignore_ascii_case("y") {
+            let world_path = root.join(PERDIR_DIR).join(WORLD_FILE);
+            fs::write(&world_path, &toml_block)?;
+            append_log(&root, "ai-apply")?;
+            println!("Manifest updated. Run `perdir install` to apply changes.");
+        } else {
+            println!("Not applied.");
+        }
+    } else {
+        println!("{}", content);
+    }
+
+    Ok(())
+}
+
+fn extract_toml_block(content: &str) -> Option<String> {
+    let start = content.find("```toml")?;
+    let after_start = &content[start + 7..];
+    let end = after_start.find("```")?;
+    Some(after_start[..end].trim().to_string())
 }
 
 fn check_permissions(world: &World) -> bool {
@@ -443,7 +607,7 @@ fn check_permissions(world: &World) -> bool {
     }
 
     if let PermissionMode::Deny = world.permissions.network {
-        eprintln!("[perdir] WARNING: network access is denied by manifest policy (not enforced — requires OS-level sandboxing)");
+        eprintln!("[perdir] Network access is denied by manifest policy — all network sockets will be blocked");
     }
 
     match world.permissions.home {
@@ -471,12 +635,76 @@ fn apply_permission_env(root: &Path, world: &World, cmd: &mut Command) {
         cmd.env_remove("https_proxy");
         cmd.env_remove("HTTP_PROXY");
         cmd.env_remove("HTTPS_PROXY");
+        sandbox::deny_network(cmd);
     }
 
     if matches!(world.permissions.home, PermissionMode::Deny) {
         let sandbox_home = root.join(PERDIR_DIR).join("home");
         let _ = fs::create_dir_all(&sandbox_home);
         cmd.env("HOME", sandbox_home.to_string_lossy().to_string());
+    }
+}
+
+mod sandbox {
+    use super::Command;
+    use std::io;
+    use std::os::unix::process::CommandExt;
+
+    pub fn deny_network(cmd: &mut Command) {
+        unsafe {
+            cmd.pre_exec(|| {
+                #[cfg(target_os = "macos")]
+                {
+                    apply_macos_sandbox()?;
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    apply_linux_namespace()?;
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                {
+                    let _ = io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "network sandboxing not supported on this OS",
+                    );
+                }
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe fn apply_macos_sandbox() -> io::Result<()> {
+        use std::ffi::CString;
+        use std::os::raw::{c_char, c_int};
+
+        extern "C" {
+            fn sandbox_init(
+                profile: *const c_char,
+                flags: u64,
+                errorbuf: *mut *mut c_char,
+            ) -> c_int;
+        }
+
+        let profile = CString::new("kSBXProfileNoNetwork").unwrap();
+        let mut err_buf: *mut c_char = std::ptr::null_mut();
+
+        // 0x0001 = SANDBOX_NAMED (built-in profile)
+        if sandbox_init(profile.as_ptr(), 0x0001, &mut err_buf) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "macOS seatbelt sandbox initialization failed",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe fn apply_linux_namespace() -> io::Result<()> {
+        if libc::unshare(libc::CLONE_NEWNET) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 
@@ -759,7 +987,7 @@ ai = { context = [], memory_file = "mem.md", model = "test" }
     }
 
     #[test]
-    fn test_ensure_venv_no_python() {
+    fn test_activate_venv_no_python() {
         let dir = tempfile::tempdir().unwrap();
         let perdir = dir.path().join(PERDIR_DIR);
         fs::create_dir_all(&perdir).unwrap();
@@ -784,7 +1012,7 @@ ai = { context = [], memory_file = "mem.md", model = "test" }
             },
         };
 
-        let result = ensure_venv(dir.path(), &world).unwrap();
+        let result = activate_venv(dir.path(), &world);
         assert!(result.is_none());
     }
 
@@ -887,5 +1115,18 @@ ai = { context = [], memory_file = "mem.md", model = "test" }
 
         assert!(!perdir.join("venv").exists());
         assert!(clean_venv(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn test_extract_toml_block_found() {
+        let content = "Here is the manifest:\n```toml\nname = \"test\"\n```\nDone.";
+        let result = extract_toml_block(content).unwrap();
+        assert_eq!(result, "name = \"test\"");
+    }
+
+    #[test]
+    fn test_extract_toml_block_not_found() {
+        let content = "No code block here.";
+        assert!(extract_toml_block(content).is_none());
     }
 }
