@@ -3,6 +3,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -38,6 +39,10 @@ enum Commands {
     Enter,
     /// Explain the current environment manifest.
     Explain,
+    /// Show the audit log for this environment.
+    Log,
+    /// Open the environment manifest in $EDITOR.
+    Edit,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -87,6 +92,8 @@ fn main() -> Result<()> {
         Commands::Run { command } => run(command),
         Commands::Enter => enter(),
         Commands::Explain => explain(),
+        Commands::Log => log(),
+        Commands::Edit => edit(),
     }
 }
 
@@ -180,6 +187,29 @@ fn enter() -> Result<()> {
     Ok(())
 }
 
+fn log() -> Result<()> {
+    let (root, _world) = load_world()?;
+    let log_path = root.join(PERDIR_DIR).join(LOG_FILE);
+    let contents = fs::read_to_string(&log_path)
+        .with_context(|| format!("could not read {}", log_path.display()))?;
+    print!("{}", contents);
+    Ok(())
+}
+
+fn edit() -> Result<()> {
+    let (root, _world) = load_world()?;
+    let manifest_path = root.join(PERDIR_DIR).join(WORLD_FILE);
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let status = Command::new(&editor)
+        .arg(&manifest_path)
+        .status()
+        .with_context(|| format!("failed to launch editor: {}", editor))?;
+    if !status.success() {
+        return Err(anyhow!("editor exited with non-zero status"));
+    }
+    Ok(())
+}
+
 fn explain() -> Result<()> {
     let (_root, world) = load_world()?;
     println!(
@@ -230,5 +260,3 @@ fn append_log(root: &Path, action: &str) -> Result<()> {
 fn shell_escape(input: &str) -> String {
     input.replace('\\', "\\\\").replace('\'', "'\\''")
 }
-
-use std::io::Write;

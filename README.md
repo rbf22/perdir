@@ -4,15 +4,91 @@ Per-directory Linux environments.
 
 `perdir` is an experimental CLI for treating every project directory as its own declared runtime, policy boundary, and AI context.
 
-## MVP
+## Install
+
+### From source
 
 ```bash
+git clone https://github.com/YOUR_GITHUB_USERNAME/perdir.git
+cd perdir
+cargo install --path .
+```
+
+### Prerequisites
+
+- [Rust](https://rustup.rs) (stable toolchain, includes `cargo`)
+
+### Verify
+
+```bash
+perdir --help
+```
+
+## Getting Started
+
+Create a new project directory and initialize a perdir environment:
+
+```bash
+mkdir my-project && cd my-project
 perdir init
+```
+
+This creates a `.perdir/` folder containing `world.toml` (the manifest), `memory.md`, and an `audit.log`.
+
+Check the current environment:
+
+```bash
 perdir status
-perdir run env
-perdir enter
+```
+
+Get a human-readable summary of the manifest:
+
+```bash
 perdir explain
 ```
+
+Run a command inside the declared environment (env vars from `world.toml` are applied):
+
+```bash
+perdir run env
+```
+
+Print shell exports for the environment. Running `perdir enter` alone shows what would be set:
+
+```bash
+$ perdir enter
+export PERDIR_ROOT='/Users/you/my-project'
+export PERDIR_NAME='my-project'
+# Run this to enter:
+# eval "$(perdir enter)"
+```
+
+To actually apply those exports to your current shell, use `eval`:
+
+```bash
+$ eval "$(perdir enter)"
+$ echo "$PERDIR_NAME"
+my-project
+```
+
+`perdir enter` prints `export` statements. `eval` runs them in your shell, setting `PERDIR_ROOT`, `PERDIR_NAME`, and any env vars from `world.toml`. This is useful when you want to run several commands in the environment without prefixing each one with `perdir run`.
+
+View the audit log of all actions taken in this environment:
+
+```bash
+$ perdir log
+2026-06-22T13:36:11+00:00 init
+2026-06-22T13:43:00+00:00 run ["env"]
+2026-06-22T13:43:55+00:00 run ["df"]
+```
+
+Edit the manifest directly in your `$EDITOR`:
+
+```bash
+perdir edit
+```
+
+## MVP
 
 This first version does **not** replace containers, Nix, or the Linux kernel. It creates the manifest and command surface that later versions can back with Nix, Bubblewrap, cgroups, seccomp, and AI-assisted patch generation.
 
